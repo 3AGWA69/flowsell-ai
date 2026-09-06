@@ -116,6 +116,7 @@ export async function POST(req: NextRequest) {
       if (!Number.isFinite(payload.sale_price) || payload.sale_price < 0) return NextResponse.json({ error: 'سعر البيع غير صحيح' }, { status: 400 });
       if (!Number.isFinite(payload.purchase_price) || payload.purchase_price < 0) return NextResponse.json({ error: 'سعر الشراء غير صحيح' }, { status: 400 });
       if (!Number.isInteger(payload.stock_quantity) || payload.stock_quantity < 0) return NextResponse.json({ error: 'المخزون غير صحيح' }, { status: 400 });
+      if (!Number.isInteger(payload.low_stock_threshold) || payload.low_stock_threshold < 0) return NextResponse.json({ error: 'حد المخزون المنخفض غير صحيح' }, { status: 400 });
       if (db()) {
         const result = body.id
           ? await supabase(`products?id=eq.${encodeURIComponent(body.id)}`, { method: 'PATCH', body: JSON.stringify(payload) })
@@ -164,48 +165,92 @@ export async function POST(req: NextRequest) {
     }
 
     if (action === 'order') {
-      const items = Array.isArray(body.items) ? body.items : [];
-      const payload = { customer: String(body.customer || 'عميل جديد').trim(), phone: String(body.phone || '').trim(), address: String(body.address || '').trim(), items, total: Number(body.total || 0), status: 'new' };
-      if (!payload.customer || !payload.phone || !payload.address || !items.length) return NextResponse.json({ error: 'بيانات الطلب غير مكتملة' }, { status: 400 });
-      if (!Number.isFinite(payload.total) || payload.total < 0) return NextResponse.json({ error: 'إجمالي الطلب غير صحيح' }, { status: 400 });
+      const rawItems = Array.isArray(body.items) ? body.items : [];
+      const customer = String(body.customer || 'عميل جديد').trim();
+      const phone = String(body.phone || '').trim();
+      const address = String(body.address || '').trim();
+      if (!customer || !phone || !address || !rawItems.length) return NextResponse.json({ error: 'بيانات الطلب غير مكتملة' }, { status: 400 });
 
-      if (db()) {
-        const ids = [...new Set(items.map((item: any) => String(item.productId || '')).filter(Boolean))];
-        if (!ids.length) return NextResponse.json({ error: 'الطلب لا يحتوي على منتجات صحيحة' }, { status: 400 });
-        const rows = await supabase(`products?select=id,name,stock_quantity,is_active&id=in.(${ids.map(encodeURIComponent).join(',')})`);
-        const byId = new Map((rows || []).map((p: any) => [p.id, p]));
-        for (const item of items) {
-          const p = byId.get(String(item.productId));
-          const qty = Number(item.qty || 0);
-          if (!p || p.is_active === false) return NextResponse.json({ error: 'أحد المنتجات لم يعد متاحًا.' }, { status: 409 });
-          if (!Number.isInteger(qty) || qty < 1) return NextResponse.json({ error: 'كمية منتج غير صحيحة.' }, { status: 400 });
-          if (Number(p.stock_quantity) < qty) return NextResponse.json({ error: `المخزون غير كافٍ للمنتج ${p.name}.` }, { status: 409 });
-        }
-        const created = await supabase('orders', { method: 'POST', body: JSON.stringify(payload) });
-        try {
-          for (const item of items) {
-            const p = byId.get(String(item.productId));
-            const qty = Number(item.qty || 0);
-            await supabase(`products?id=eq.${encodeURIComponent(item.productId)}`, { method: 'PATCH', body: JSON.stringify({ stock_quantity: Number(p.stock_quantity) - qty }) });
-          }
-        } catch (stockError) {
-          // Keep the order recorded; the runtime log will expose a stock-sync failure for repair.
-          console.error('Stock update failed after order creation', stockError);
-        }
-        return NextResponse.json({ ok: true, order: normalizeOrder(created?.[0] || payload) });
+      // Never trust client-side prices, totals, names, or stock. Rebuild the order from the database.
+      const quantities = new Map<string, number>();
+      for (const item of rawItems) {
+        const productId = String(item?.productId || '').trim();
+        const qty = Number(item?.qty || 0);
+        if (!productId || !Number.isInteger(qty) || qty < 1) return NextResponse.json({ error: 'بيانات أحد المنتجات غير صحيحة.' }, { status: 400 });
+        quantities.set(productId, (quantities.get(productId) || 0) + qty);
       }
 
-      const order = { ...payload, id: `ord-${Date.now()}`, created_at: new Date().toISOString() };
+      if (db()) {
+        const ids = [...quantities.keys()];
+        const rows = await supabase(`products?select=id,name,sale_price,stock_quantity,is_active&id=in.(${ids.map(encodeURIComponent).join(',')})`);
+        const byId = new Map((rows || []).map((p: any) => [String(p.id), p]));
+        const serverItems: Array<{ productId: string; name: string; price: number; qty: number }> = [];
+        let computedTotal = 0;
+
+        for (const [productId, qty] of quantities) {
+          const p = byId.get(productId);
+          if (!p || p.is_active === false) return NextResponse.json({ error: 'أحد المنتجات لم يعد متاحًا.' }, { status: 409 });
+          const price = Number(p.sale_price);
+          const stock = Number(p.stock_quantity);
+          if (!Number.isFinite(price) || price < 0) return NextResponse.json({ error: `سعر المنتج ${p.name} غير صحيح.` }, { status: 409 });
+          if (stock < qty) return NextResponse.json({ error: `المخزون غير كافٍ للمنتج ${p.name}. المتاح ${stock} قطعة.` }, { status: 409 });
+          serverItems.push({ productId, name: p.name, price, qty });
+          computedTotal += price * qty;
+        }
+
+        const orderPayload = { customer, phone, address, items: serverItems, total: Number(computedTotal.toFixed(2)), status: 'new' };
+        const created = await supabase('orders', { method: 'POST', body: JSON.stringify(orderPayload) });
+        const changed: Array<{ id: string; previousStock: number }> = [];
+
+        try {
+          for (const item of serverItems) {
+            const p = byId.get(item.productId)!;
+            const previousStock = Number(p.stock_quantity);
+            const result = await supabase(`products?id=eq.${encodeURIComponent(item.productId)}&stock_quantity=gte.${item.qty}`, {
+              method: 'PATCH',
+              body: JSON.stringify({ stock_quantity: previousStock - item.qty }),
+            });
+            if (!result?.length) throw new Error(`Stock update rejected for ${item.productId}`);
+            changed.push({ id: item.productId, previousStock });
+          }
+        } catch (stockError) {
+          for (const item of changed.reverse()) {
+            try {
+              await supabase(`products?id=eq.${encodeURIComponent(item.id)}`, { method: 'PATCH', body: JSON.stringify({ stock_quantity: item.previousStock }) });
+            } catch (rollbackError) {
+              console.error('Stock rollback failed', rollbackError);
+            }
+          }
+          if (created?.[0]?.id) {
+            try { await supabase(`orders?id=eq.${encodeURIComponent(created[0].id)}`, { method: 'DELETE' }); } catch (deleteError) { console.error('Order rollback failed', deleteError); }
+          }
+          console.error('Order stock transaction failed', stockError);
+          return NextResponse.json({ error: 'تعذر تأكيد المخزون. لم يتم تسجيل الطلب.' }, { status: 409 });
+        }
+
+        return NextResponse.json({ ok: true, order: normalizeOrder(created?.[0] || orderPayload) });
+      }
+
+      const serverItems = rawItems.map((item: any) => {
+        const p = memory.products.find(x => x.id === String(item.productId));
+        if (!p || !p.active) throw new Error('المنتج غير متاح');
+        const qty = quantities.get(p.id) || 0;
+        if (p.stock < qty) throw new Error(`المخزون غير كافٍ للمنتج ${p.name}`);
+        return { productId: p.id, name: p.name, price: p.price, qty };
+      }).filter((item: any, index: number, arr: any[]) => arr.findIndex(x => x.productId === item.productId) === index);
+      const computedTotal = serverItems.reduce((sum: number, item: any) => sum + item.price * item.qty, 0);
+      const order = { customer, phone, address, items: serverItems, total: Number(computedTotal.toFixed(2)), status: 'new', id: `ord-${Date.now()}`, created_at: new Date().toISOString() };
       memory.orders.unshift(normalizeOrder(order));
-      for (const item of order.items) {
+      for (const item of serverItems) {
         const p = memory.products.find(x => x.id === item.productId);
-        if (p) p.stock = Math.max(0, p.stock - Number(item.qty || 0));
+        if (p) p.stock -= item.qty;
       }
       return NextResponse.json({ ok: true, order: normalizeOrder(order) });
     }
 
     if (action === 'orderStatus') {
-      if (!body.id || !body.status) return NextResponse.json({ error: 'بيانات الحالة غير مكتملة' }, { status: 400 });
+      const allowed = new Set(['new', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled']);
+      if (!body.id || !allowed.has(String(body.status))) return NextResponse.json({ error: 'حالة الطلب غير صحيحة' }, { status: 400 });
       if (db()) await supabase(`orders?id=eq.${encodeURIComponent(body.id)}`, { method: 'PATCH', body: JSON.stringify({ status: body.status }) });
       else { const o = memory.orders.find(x => x.id === body.id); if (o) o.status = body.status; }
       return NextResponse.json({ ok: true });
