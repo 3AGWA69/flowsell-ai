@@ -1,6 +1,6 @@
 {
-  "name": "ai-sales-assistant-demo",
-  "version": "1.0.0",
+  "name": "flowsell-ai",
+  "version": "2.0.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
